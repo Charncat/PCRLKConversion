@@ -27,6 +27,109 @@ DupFile = 'SOP-101_v1_duplex_qPCR_day2_manual_QS1.xls'
 ReagentFile = 'FRM-101-01_updated_draft.xlsx'
 Assay = '101'
 
+BASE   = "https://originsciences.app.labkey.host"
+FOLDER = "home"
+SCHEMA = "samples"
+APIKEY = "5830a18d79e74c1589bda8df43762f1a348d0ad85d243c075465df6329fa4b29"
+
+s = requests.Session()
+s.headers["Authorization"] = f"LABKEY apikey={APIKEY}"
+
+def query_labkey(path, **params):
+    r = s.get(f"{BASE}/home/{path}", params={"containerPath": FOLDER, "columns": "", **params}, timeout=30)
+
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        print("Status:", r.status_code)
+        try:
+            print(r.json(),)
+        except Exception:
+            print(r.text)
+    
+    r.raise_for_status()
+    return r.json()
+
+def query_labkey_rest_api(path_controller_action: str, **params: str) -> json:
+  host = "originsciences.app.labkey.host"
+  container = "home"
+  try:
+    request = requests.get(
+      f"https://{host}/home/{path_controller_action}",
+      params={"containerPath": container, **params}
+    )
+  except requests.HTTPError as e:
+    print(f"Error: HTTP request to LabKey failed: {path_controller_action}")
+    print("This could be due to invalid credentials or a lack of permissions")
+    print(f"{type(e).__name__} was raised: {e}")
+    sys.exit(1)
+  return request.json()
+
+def find_templates() -> list:
+  queries = query_labkey_rest_api("/query-GetQueries.api", schemaName="workflow.jobtypes", maxRows=None).get("queries", [])
+  templates_list = [x.get("name") for x in queries]
+  return templates_list
+
+def query_workflow_fields(batch_id: str) -> pd.DataFrame:
+  job_templates = find_templates()
+
+  def fetch_template(job_template):
+    sql = f"""
+    SELECT
+    jt.Name,
+    jt.BatchID,
+    CAST(jt.QubitOperator.DisplayName AS VARCHAR) AS QubitOperator
+    FROM {job_template} as jt
+    WHERE jt.BatchID = '{batch_id}'
+    """
+    return pd.DataFrame(query_labkey_rest_api("/query-executeSql.api", schemaName="workflow.jobtypes",
+                                              sql=sql, maxRows=None).get("rows", []))
+
+  with ThreadPoolExecutor() as executor:
+    dfs = list(executor.map(fetch_template, job_templates))
+
+  workflows_df = pd.concat(dfs, axis=0, ignore_index=True) if dfs else pd.DataFrame(columns=["Name", "BatchID", "QubitOperator"])
+  return workflows_df[["Name", "BatchID", "QubitOperator"]]
+
+def getjobs():
+  df = query_workflow_fields(BatchID)
+  df.fillna('-', inplace=True)
+  #df = df[~df.isnull().any(axis=1)]
+  return df
+
+# Function to deduplicate rows by adding a suffix
+def addsuffix(df, col, group):
+    
+    df[col] += df.groupby(group).cumcount().add(1).astype(str).radd('_').mask(df.groupby(group)[col].transform('count')==1,'')
+    return df
+
+# Function to pull all Human DNA and what OriCol Aliquots they were extracted from.
+def get_samples(assay_name, BatchID):
+    sql=f'SELECT Name,ExtractedFrom,{BatchID} AS BatchID, CAST(ExtractedFrom.Name AS VARCHAR) AS ExtractedFrom FROM samples."{assay_name}"'
+
+    results = pd.DataFrame(query_labkey("/query-executeSql.api", schemaName="core", sql=sql, maxRows=max_rows, includeHidden=True).get("rows", []))
+    return results
+
+def get_samples2(assay_name):
+    sql=f'SELECT Name,SecondaryParent,ExperimentID AS BatchID, CAST(SecondaryParent.Name AS VARCHAR) AS ExtractedFrom_1 FROM samples."{assay_name}"'
+
+    results = pd.DataFrame(query_labkey("/query-executeSql.api", schemaName="core", sql=sql, maxRows=max_rows, includeHidden=True).get("rows", []))
+    return results
+
+# Fire all three API fetches concurrently — they only depend on BatchID (already extracted above).
+custom_sql_select_query = ", CAST(SampleID.Name AS VARCHAR) AS Sample_ID, CAST(Run.BatchID AS VARCHAR) AS Batch_ID"
+
+def _fetch_manifest(assay_name):
+    manifest_sql = f'SELECT *{custom_sql_select_query} FROM assay.General."{assay_name}".Data AS d'
+    return pd.DataFrame(query_labkey("/query-executeSql.api", schemaName="core", sql=manifest_sql,
+                                     maxRows=max_rows, includeHidden=True).get("rows", []))
+
+# Name search function
+def namesearch(regex):
+    for filename in os.listdir():
+        if re.search(regex, filename):
+            return filename
+
 # Import Reagent File to extract Run Information, use iloc because column names might change.
 
 RunInfo = pd.read_excel(ReagentFile, header=3, usecols='B,E,F,G,I,J,K') 
@@ -133,7 +236,7 @@ if Assay == '101':
 
 elif Assay == '61':
     
-    Duplex, Standards, RunStandards, RunErrors = get_results('FAM', 'RNase P')
+    Results, Standards, RunStandards, RunErrors = get_results('FAM', 'RNase P')
     Standards = Standards.transpose()
     Standards['Processed Date'] = RunDate
     
@@ -150,7 +253,7 @@ elif Assay == '61':
 
 elif Assay == '69':
 
-    Duplex, Standards, RunStandards, RunErrors = get_results('VIC', '16S')
+    Results, Standards, RunStandards, RunErrors = get_results('VIC', '16S')
     Standards = Standards.transpose()    
     Standards['Processed Date'] = RunDate
     
@@ -165,9 +268,44 @@ elif Assay == '69':
     RunInfo = pd.concat([RunInfo, Reagents, Standards], axis=1)
     RunInfo = RunInfo.transpose()
 
+with ThreadPoolExecutor(max_workers=6) as executor:
+    future_manifest_98 = executor.submit(_fetch_manifest, "SOP-98 Manifest Creation")
+    future_manifest_64 = executor.submit(_fetch_manifest, "SOP-64 Manifest Creation")
+    future_human      = executor.submit(get_samples, "Human DNA", "BatchID")
+    future_bulk     = executor.submit(get_samples2, "DNA")
+    future_microbial = executor.submit(get_samples, "Microbial DNA", "DEXID")
+    future_jobs     = executor.submit(getjobs)
+
+# API call to get manifest, contains list of samples and their 'numbers', filtered down to relevant Run ID and then positions converted to just number.
+Manifest = pd.concat([future_manifest_98.result(), future_manifest_64.result()], ignore_index=True)
+Manifest = Manifest[['ProcessPosition', 'Batch_ID', 'Sample_ID']]
+Manifest = Manifest[Manifest['Batch_ID'] == BatchID]
+Manifest['SampleNumber'] = Manifest['ProcessPosition'].str.extract(r'(\d+)').astype(int)
+Manifest = Manifest[['Sample_ID', 'SampleNumber']]
+
+# All Human DNA is called and then filtered down to the relevant Run ID
+DNAHu = future_human.result()
+DNAMb = future_microbial.result()
+DNABk = future_bulk.result()
+DNAHu = pd.concat([DNAHu, DNAMb, DNABk])
+DNAHu = DNAHu[DNAHu['BatchID'] == BatchID]
+DNAHu = DNAHu[['ExtractedFrom_1', 'Name']]
+
+
+# Dedupe both Human DNA and Manifest.
+DNAHu = addsuffix(DNAHu,'ExtractedFrom_1','ExtractedFrom_1')
+Manifest = addsuffix(Manifest,'Sample_ID','Sample_ID')
+
+# Merge both dataframes, drop uneeded columns.
+Manifest = Manifest.merge(DNAHu, how='inner', left_on='Sample_ID', right_on='ExtractedFrom_1')
+Manifest = Manifest[['SampleNumber', 'Name']]
+
+Results = Results.merge(Manifest, how='inner', left_on='Sample Number', right_on='SampleNumber')
+Results['Sample Name'] = Results['Name']
+Results.drop(columns=['SampleNumber','Name'],inplace=True)
     
-with pd.ExcelWriter("Duplex Conversion.xlsx") as writer:
-    Results.to_excel(writer, sheet_name="Results", index=False)
-    Standards.to_excel(writer, sheet_name="Standards", index=False)
-    RunStandards.to_excel(writer, sheet_name='Sample Standards')
-    RunInfo.to_excel(writer, sheet_name='Run Information', index=False)
+# with pd.ExcelWriter("Duplex Conversion.xlsx") as writer:
+#     Results.to_excel(writer, sheet_name="Results", index=False)
+#     Standards.to_excel(writer, sheet_name="Standards", index=False)
+#     RunStandards.to_excel(writer, sheet_name='Sample Standards')
+#     RunInfo.to_excel(writer, sheet_name='Run Information', index=False)
