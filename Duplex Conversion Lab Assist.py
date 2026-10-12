@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Created on Thu Sep 24 2026
 
@@ -191,18 +190,21 @@ def get_results(Reporter, SubAssay):
     GetStandards = WellResults.loc[~WellResults['Sample Type'].str.contains('Sample')].drop_duplicates(subset=['Sample Name','Reporter','Ct Mean', 'Ct SD']).copy()
     GetStandards = GetStandards[GetStandards['Reporter'] == Reporter].reset_index()
     Standards = GetStandards[['Sample Name', 'Ct Mean', 'Ct SD', ]].copy()
-    Standards = Standards.set_index('Sample Name')
+    Standards = Standards.set_index('Sample Name').stack(dropna=False).to_frame().T
+    Standards.columns = [f"{name} {metric}" for name, metric in Standards.columns]
+    Standards = Standards.transpose()
     # Human DNA Male is an RNase P control, so only check it on the FAM reporter.
     DNAString = []
     if Reporter == 'FAM':
-        if 'Human DNA Male' in Standards.index:
-            DNAMale = Standards.at['Human DNA Male','Ct Mean']
+        if 'Human DNA Male Ct Mean' in Standards.index:
+            DNAMale = Standards.at['Human DNA Male Ct Mean',0]
             DNAString = MaleDNACheck(DNAMale)
         else:
             DNAString = [f'\nHuman DNA Male control not found for {BatchID}, control check skipped.']
-    Standards.rename(columns={'Ct Mean':Reporter + ' Mean Ct', 'Ct SD':Reporter + ' Ct SD'}, inplace=True)
+    
     Standards = Standards.fillna('0')
-
+    Standards = Standards.transpose()
+    Standards.columns = [f"{SubAssay} {col}" for col in Standards.columns]
 
     #Get curve values
     Slope = GetStandards['Slope'][0]
@@ -254,16 +256,20 @@ def getLCResults(Filename, Reporter, SubAssay):
     GetStandards = WellResults.loc[~WellResults['Sample Name'].str.contains('Sample')].copy()
 
     Standards = GetStandards[['Sample Name', 'Ct Mean', 'Ct SD', ]].copy()
-    Standards = Standards.set_index('Sample Name')
+    Standards = Standards.set_index('Sample Name').stack(dropna=False).to_frame().T
+    Standards.columns = [f"{name} {metric}" for name, metric in Standards.columns]
+    Standards = Standards.transpose()
     # Human DNA Male is an RNase P control, so only check it on the FAM reporter.
     DNAString = []
     if Reporter == 'FAM':
         if 'Human DNA Male' in Standards.index:
-            DNAMale = Standards.at['Human DNA Male','Ct Mean']
+            DNAMale = Standards.at['Human DNA Male Ct Mean',0]
             DNAString = MaleDNACheck(DNAMale)
         else:
             DNAString = [f'\nHuman DNA Male control not found for {BatchID}, control check skipped.']
-    Standards.rename(columns={'Ct Mean':Reporter + ' Mean Ct', 'Ct SD':Reporter + ' Ct SD'}, inplace=True)
+    Standards = Standards.fillna('0')
+    Standards = Standards.transpose()
+    Standards.columns = [f"{SubAssay} {col}" for col in Standards.columns]
     
     Standards2 = Results[Results['Samples'].str.contains(': ', na=False)].copy()
     Standards2[['Type', 'Results']] = Standards2['Samples'].str.split(': ', expand=True)
@@ -322,6 +328,10 @@ if Assay == '101':
     Results = pd.concat([Results, Reagents], axis=1)
     Results[Reagents.columns] = Results[Reagents.columns].ffill()
     Results['Asset ID'] = AssetID
+    Results = pd.concat([Results, PCR16SSampleStandards, RNasePSampleStandards], axis=1)
+    Results[PCR16SSampleStandards.columns] = Results[PCR16SSampleStandards.columns].ffill()
+    Results[RNasePSampleStandards.columns] = Results[RNasePSampleStandards.columns].ffill()
+
 
     RunInfo = pd.DataFrame(data=[[Operator, BatchID, RunDate]], columns=['Operator', 'Batch ID', 'Processed Date'])
 
@@ -340,6 +350,8 @@ elif Assay == '61':
 
     RunInfo = pd.concat([RunInfo, Reagents, Standards], axis=1)
     RunInfo = RunInfo.transpose()
+    Results = pd.concat([Results, RunStandards], axis=1)
+    Results[RunStandards.columns] = Results[RunStandards.columns].ffill()
 
 elif Assay == '69':
 
@@ -356,6 +368,8 @@ elif Assay == '69':
 
     RunInfo = pd.concat([RunInfo, Reagents, Standards], axis=1)
     RunInfo = RunInfo.transpose()
+    Results = pd.concat([Results, RunStandards], axis=1)
+    Results[RunStandards.columns] = Results[RunStandards.columns].ffill()
 
 # Batch ID is put into the LabKey SQL, so it must be alphanumeric.
 batch_id = str(BatchID)
@@ -420,7 +434,6 @@ RunErrors = pd.DataFrame({'Run Errors': RunErrors.split('\n') if RunErrors else 
 with pd.ExcelWriter("Duplex Conversion.xlsx") as writer:
     Results.to_excel(writer, sheet_name="Results", index=False)
     Standards.to_excel(writer, sheet_name="Standards", index=False)
-    RunStandards.to_excel(writer, sheet_name='Sample Standards')
     # 61 and 69 Run Information is transposed, so its labels are in the index.
     RunInfo.to_excel(writer, sheet_name='Run Information', index=(Assay != '101'))
     RunErrors.to_excel(writer, sheet_name='Run Errors', index=False)
